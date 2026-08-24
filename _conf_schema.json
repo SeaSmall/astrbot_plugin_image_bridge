@@ -1,0 +1,46 @@
+{
+  "ocr_api_url": {
+    "type": "string",
+    "description": "OCR 接口地址",
+    "hint": "默认使用 OCR.space 免费接口。",
+    "default": "https://api.ocr.space/parse/image"
+  },
+  "ocr_api_key": {
+    "type": "string",
+    "description": "OCR.space 免费 API Key",
+    "hint": "默认 \"helloworld\" 为 OCR.space 公开测试 key（免费但有限流）。建议到 https://ocr.space/ocrapi 免费注册获取专属 key。",
+    "default": "helloworld"
+  },
+  "ocr_language": {
+    "type": "string",
+    "description": "OCR 识别语言",
+    "hint": "OCR.space 语言代码：chs=简体中文，eng=英文，chinese_tra=繁体中文等。",
+    "default": "chs"
+  },
+  "ocr_timeout": {
+    "type": "int",
+    "description": "OCR 请求超时时间（秒）",
+    "default": 60
+  },
+  "pending_ttl": {
+    "type": "int",
+    "description": "图片识别内容有效期（秒），超时后需重新发送图片",
+    "default": 1800
+  },
+  "prompt_template": {
+    "type": "text",
+    "description": "注入给 AI 的提示词模板，{image_content} 会被替换为识别出的文字",
+    "default": "<用户上传的图片识别内容>\n{image_content}\n</用户上传的图片识别内容>\n以上是用户刚上传图片的 OCR 识别文字，请结合该图片内容回答用户的问题。"
+  },
+  "wait_hint": {
+    "type": "text",
+    "description": "收到图片（未带问题）时的提示语",
+    "default": "✅ 已收到图片并完成识别，请继续输入你的问题～"
+  },
+  "show_ocr_preview": {
+    "type": "bool",
+    "description": "收到图片的提示语中是否附带识别结果摘要",
+    "default": true
+  }
+}
+
