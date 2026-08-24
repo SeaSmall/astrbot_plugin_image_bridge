@@ -31,16 +31,6 @@
     "type": "text",
     "description": "注入给 AI 的提示词模板，{image_content} 会被替换为识别出的文字",
     "default": "<用户上传的图片识别内容>\n{image_content}\n</用户上传的图片识别内容>\n以上是用户刚上传图片的 OCR 识别文字，请结合该图片内容回答用户的问题。"
-  },
-  "wait_hint": {
-    "type": "text",
-    "description": "收到图片（未带问题）时的提示语",
-    "default": "✅ 已收到图片并完成识别，请继续输入你的问题～"
-  },
-  "show_ocr_preview": {
-    "type": "bool",
-    "description": "收到图片的提示语中是否附带识别结果摘要",
-    "default": true
   }
 }
 

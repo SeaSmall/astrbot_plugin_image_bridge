@@ -3,7 +3,7 @@ astrbot_plugin_image_bridge — 图片问答桥接插件（Image Bridge）
 
 功能：
 1. 用户发送图片时，插件调用免费 OCR 接口（OCR.space）识别图片中的文字。
-2. 若用户只发了图片（未附带文字问题），AI 不会回答，插件会提示用户继续输入问题。
+2. 若用户只发了图片（未附带文字问题），AI 不会回答，插件静默挂起识别内容，后台等待用户输入问题。
 3. 用户随后发送文字问题时，插件把图片识别内容一并注入本次 LLM 请求，
    让 AI 结合图片内容回答（即"图片门控问答"：先发图，再提问，AI 才作答）。
 
@@ -38,8 +38,6 @@ DEFAULT_PROMPT_TEMPLATE = (
     "</用户上传的图片识别内容>\n"
     "以上是用户刚上传图片的 OCR 识别文字，请结合该图片内容回答用户的问题。"
 )
-DEFAULT_WAIT_HINT = "✅ 已收到图片并完成识别，请继续输入你的问题～"
-DEFAULT_SHOW_PREVIEW = True  # 收到图片的提示语中是否附带识别结果摘要
 
 
 class ImageBridgePlugin(Star):
@@ -189,13 +187,8 @@ class ImageBridgePlugin(Star):
             )
             return
 
-        # 只发了图片：拦截本次消息（AI 不回答），提示用户继续输入问题
+        # 只发了图片：静默挂起识别内容，拦截本次消息（AI 不回答），后台等待用户提问
         event.stop_event()
-        hint = self._cfg("wait_hint", DEFAULT_WAIT_HINT)
-        if self._cfg("show_ocr_preview", DEFAULT_SHOW_PREVIEW):
-            preview = content if len(content) <= 80 else content[:77] + "..."
-            hint = f"{hint}\n（识别摘要：{preview}）"
-        yield event.plain_result(hint)
 
     @filter.command("picreset")
     async def picreset(self, event: AstrMessageEvent):
