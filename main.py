@@ -20,7 +20,7 @@ from pathlib import Path
 import httpx
 
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, EventMessageType, filter
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 
@@ -157,7 +157,7 @@ class ImageBridgePlugin(Star):
             self._pending.clear()
 
     # ---------------------------------------------------------------- 事件
-    @filter.event_message_type(EventMessageType.ALL)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
         """处理图片消息：识别并挂起识别内容；纯图片消息不让 AI 回答。"""
         images = self._extract_images(event)
