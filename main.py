@@ -248,11 +248,10 @@ class ImageBridgePlugin(Star):
         """处理图片/表情消息：识别并挂起内容；纯图片/表情消息不让 AI 回答（等待提问）。
 
         表情处理：QQ 官方把表情解析为 `[表情]`/`[表情:赞]` 文本 + 图片附件。
-        - `[表情:赞]` 文本标记 AI 可理解，提取语义描述一并注入；
-        - 表情包图片（多为 gif 动图）**切帧为静态图后进 OCR**，识别出表情包上的文字，
-          让 AI 真正"看懂"用户发了什么表情包；
-        - `emoji_wait_pending` 开关：关闭时表情（含表情包）**不拦截等待提问**，
-          AI 直接回复，识别内容仍注入 LLM 供参考。
+        - `[表情:赞]`（带名字）：文本本身有语义，AI 可直接理解 -> 永不拦截，直接回复；
+        - `[表情]`（无名字，自定义表情包）：切帧 OCR 识别文字后，默认拦截等待提问，
+          受 `emoji_wait_pending` 开关控制（关闭则直接回复）；
+        - 表情包图片（多为 gif 动图）**切帧为静态图后进 OCR**，识别出表情包上的文字。
         """
         text = (event.message_str or "").strip()
         # 去掉表情标记后的"真实文字"：QQ 把表情转成 [表情]/[表情:赞] 文本，
@@ -289,16 +288,6 @@ class ImageBridgePlugin(Star):
         if not content:
             return  # 无任何可挂起内容
 
-        # emoji_wait_pending=false：表情（含表情包，无论是否带图）不参与"等待提问"——
-        # 不拦截消息，AI 正常回复；识别内容仍挂起，随本次/下次 LLM 请求注入
-        if emoji_desc and not bool(
-            self._cfg("emoji_wait_pending", DEFAULT_EMOJI_WAIT_PENDING)
-        ):
-            logger.debug("[image_bridge] 表情不参与等待（emoji_wait_pending=false），放行")
-            self._pending[key] = {"text": content, "ts": time.time()}
-            self._prune_pending()
-            return
-
         self._pending[key] = {"text": content, "ts": time.time()}
         self._prune_pending()
 
@@ -309,7 +298,21 @@ class ImageBridgePlugin(Star):
             )
             return
 
-        # 只发了图片/表情：静默挂起识别内容，拦截本次消息（AI 不回答），后台等待用户提问
+        # 表情放行规则（仅当无真实文字时判断）：
+        # - [表情:xxx]（带名字）：文本本身有语义，AI 可直接理解 -> 永不拦截，直接回复
+        # - [表情]（无名字，自定义表情包）：需 OCR 才能理解 -> 默认拦截等待提问，
+        #   受 emoji_wait_pending 开关控制（关闭则放行，AI 直接回复）
+        if emoji_desc:
+            m = EMOJI_RE.search(text)
+            named = bool(m and (m.group(1) or "").strip())
+            if named:
+                logger.debug("[image_bridge] 带名字表情 [表情:xxx]，AI 可直接理解，放行")
+                return
+            if not bool(self._cfg("emoji_wait_pending", DEFAULT_EMOJI_WAIT_PENDING)):
+                logger.debug("[image_bridge] 表情包不参与等待（emoji_wait_pending=false），放行")
+                return
+
+        # 只发了图片/无名字表情包：静默挂起识别内容，拦截本次消息（AI 不回答），后台等待用户提问
         event.stop_event()
 
     @filter.command("picreset")
