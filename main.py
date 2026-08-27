@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import mimetypes
 import re
+import tempfile
 import time
+import uuid
 from pathlib import Path
 
 import httpx
@@ -72,7 +74,7 @@ class ImageBridgePlugin(Star):
         """从消息文本提取 QQ 表情语义描述（AI 可理解），无表情标记返回 None。
 
         - `[表情:赞]` -> "用户发送了一个表情：[赞]"
-        - `[表情]`（自定义表情包，无具体名）-> "用户发送了一个表情包（内容见附件图片，无法 OCR 识别）"
+        - `[表情]`（自定义表情包，无具体名）-> "用户发送了一个表情包（内容见下方 OCR 识别文字）"
         """
         m = EMOJI_RE.search(text or "")
         if not m:
@@ -80,7 +82,7 @@ class ImageBridgePlugin(Star):
         name = (m.group(1) or "").strip()
         if name:
             return f"用户发送了一个表情：[{name}]"
-        return "用户发送了一个表情包（具体内容见附件图片，表情动图无法通过 OCR 识别）"
+        return "用户发送了一个表情包（具体内容见下方 OCR 识别文字）"
 
     @staticmethod
     def _is_emoji_image(comp, text: str) -> bool:
@@ -99,15 +101,18 @@ class ImageBridgePlugin(Star):
         return False
 
     def _extract_images(self, event: AstrMessageEvent, text: str = "") -> list:
-        """从消息链中提取所有 Image 组件（自动跳过平台表情图，避免把表情当图片 OCR）。"""
+        """从消息链中提取所有 Image 组件。
+
+        表情图（QQ 官方把表情解析为 [表情] 文本 + 图片附件）**不跳过**——
+        表情包 gif 会切帧后进 OCR，让 AI 识别出表情包上的文字。
+        """
         components = getattr(event.message_obj, "message", None) or []
         images = []
         for comp in components:
             ctype = getattr(comp, "type", None)
             if ctype == "image" or type(comp).__name__ == "Image":
                 if self._is_emoji_image(comp, text):
-                    logger.debug("[image_bridge] 跳过平台表情图（不进入 OCR）")
-                    continue
+                    logger.debug("[image_bridge] 表情图进入切帧 OCR（识别表情包文字）")
                 images.append(comp)
         return images
 
@@ -126,8 +131,34 @@ class ImageBridgePlugin(Star):
             return "bmp"
         return ""
 
+    @staticmethod
+    def _gif_to_static_frame(file_path: str) -> str:
+        """GIF 动图取第一帧转为 JPEG 静态图（供 OCR 识别）。
+
+        表情包多为 gif 动图，OCR 无法直接识别动图；切第一帧后即可识别
+        表情包上的文字（参考 AstrBot 生态 smart_imagechat_hub 的做法）。
+        返回临时 JPEG 路径；失败时返回原路径。
+        """
+        try:
+            from PIL import Image as PILImage
+        except ImportError:
+            logger.warning("[image_bridge] 未安装 Pillow，gif 切帧不可用（pip install Pillow）")
+            return file_path
+        try:
+            with PILImage.open(file_path) as img:
+                img.seek(0)  # 第一帧
+                frame = img.convert("RGB")
+                tmp = Path(tempfile.gettempdir()) / f"image_bridge_frame_{uuid.uuid4().hex}.jpg"
+                frame.save(tmp, "JPEG", quality=92)
+                frame.close()
+                logger.debug(f"[image_bridge] gif 已切帧: {file_path} -> {tmp}")
+                return str(tmp)
+        except Exception as e:
+            logger.warning(f"[image_bridge] gif 切帧失败，使用原图: {e}")
+            return file_path
+
     async def _recognize_image(self, file_path: str) -> str:
-        """调用 OCR 接口识别单张图片，返回识别文字。"""
+        """调用 OCR 接口识别单张图片，返回识别文字（gif 动图自动切帧为静态图）。"""
         api_url = self._cfg("ocr_api_url", DEFAULT_OCR_API_URL)
         api_key = self._cfg("ocr_api_key", DEFAULT_OCR_API_KEY)
         language = self._cfg("ocr_language", DEFAULT_OCR_LANGUAGE)
@@ -140,6 +171,11 @@ class ImageBridgePlugin(Star):
         ext = Path(file_path).suffix.lower().lstrip(".")
         if ext not in ("png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp"):
             ext = self._sniff_image_ext(data)
+        # gif 动图（后缀或文件头识别）：切第一帧为 JPEG 再 OCR
+        if ext == "gif" or self._sniff_image_ext(data) == "gif":
+            file_path = self._gif_to_static_frame(file_path)
+            data = Path(file_path).read_bytes()
+            ext = "jpg"
         mime, _ = mimetypes.guess_type(f"image.{ext}") if ext else (None, None)
         mime = mime or "application/octet-stream"
         filename = f"image.{ext}" if ext else "image.bin"
@@ -179,16 +215,11 @@ class ImageBridgePlugin(Star):
         return bool(images)
 
     async def _recognize_images(self, images: list) -> str:
-        """逐张识别图片，拼接多图识别结果（gif 动图不 OCR，附占位说明供 AI 知晓）。"""
+        """逐张识别图片，拼接多图识别结果（gif 动图自动切帧后识别，让 AI 看懂表情包）。"""
         parts = []
         for i, img in enumerate(images, start=1):
             if self._is_gif([img]):
-                logger.debug("[image_bridge] 动图不进入 OCR，附占位说明")
-                if len(images) > 1:
-                    parts.append(f"图片{i}:（GIF 动图，无法识别文字内容）")
-                else:
-                    parts.append("（GIF 动图，无法识别文字内容）")
-                continue
+                logger.debug("[image_bridge] 动图将切帧后识别（表情包文字）")
             try:
                 file_path = await img.convert_to_file_path()
             except Exception as e:
@@ -217,8 +248,9 @@ class ImageBridgePlugin(Star):
         """处理图片/表情消息：识别并挂起内容；纯图片/表情消息不让 AI 回答（等待提问）。
 
         表情处理：QQ 官方把表情解析为 `[表情]`/`[表情:赞]` 文本 + 图片附件。
-        - 文本标记本身 AI 可理解（`[表情:赞]`），表情图（gif）不进 OCR；
-        - 自定义表情包（`[表情]` 无名字 + gif 图）生成语义描述挂起，AI 至少知道用户发了表情包；
+        - `[表情:赞]` 文本标记 AI 可理解，提取语义描述一并注入；
+        - 表情包图片（多为 gif 动图）**切帧为静态图后进 OCR**，识别出表情包上的文字，
+          让 AI 真正"看懂"用户发了什么表情包；
         - `emoji_wait_pending` 开关：关闭时表情不挂起、不拦截，消息正常走（文本标记进 LLM）。
         """
         text = (event.message_str or "").strip()

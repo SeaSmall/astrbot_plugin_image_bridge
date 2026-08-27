@@ -2,7 +2,7 @@ name: astrbot_plugin_image_bridge
 display_name: 图片问答桥接
 desc: 图片先经免费 OCR 接口（OCR.space）识别，用户随后发送文字提问时，将识别内容一并注入 LLM；只发图片不提问则 AI 不回答。
 short_desc: 图片识别 + 文字提问，AI 一并作答
-version: v1.0.3
+version: v1.0.4
 author: SeaSmall
 repo: https://github.com/SeaSmall/astrbot_plugin_image_bridge
 license: MIT
