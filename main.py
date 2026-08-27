@@ -14,6 +14,7 @@ astrbot_plugin_image_bridge — 图片问答桥接插件（Image Bridge）
 from __future__ import annotations
 
 import mimetypes
+import re
 import time
 from pathlib import Path
 
@@ -32,12 +33,16 @@ DEFAULT_OCR_API_KEY = "helloworld"  # OCR.space 公开测试 key（免费、有�
 DEFAULT_OCR_LANGUAGE = "chs"  # chs=简体中文 / eng=英文 / chinese_tra=繁体中文 ...
 DEFAULT_OCR_TIMEOUT = 60  # OCR 请求超时（秒）
 DEFAULT_PENDING_TTL = 1800  # 图片识别内容有效期（秒），超时后需重新发送图片
+DEFAULT_EMOJI_WAIT_PENDING = True  # 表情是否也参与「发送后等待提问」门控
 DEFAULT_PROMPT_TEMPLATE = (
     "<用户上传的图片识别内容>\n"
     "{image_content}\n"
     "</用户上传的图片识别内容>\n"
     "以上是用户刚上传图片的 OCR 识别文字，请结合该图片内容回答用户的问题。"
 )
+
+# QQ 官方平台表情标记：<faceType=...> 被 _parse_face_message 转成 [表情] 或 [表情:赞]
+EMOJI_RE = re.compile(r"\[表情(?::([^\]]+))?\]")
 
 
 class ImageBridgePlugin(Star):
@@ -63,13 +68,46 @@ class ImageBridgePlugin(Star):
         return f"{event.unified_msg_origin}:::{event.get_sender_id()}"
 
     @staticmethod
-    def _extract_images(event: AstrMessageEvent) -> list:
-        """从消息链中提取所有 Image 组件。"""
+    def _extract_emoji_desc(text: str) -> str | None:
+        """从消息文本提取 QQ 表情语义描述（AI 可理解），无表情标记返回 None。
+
+        - `[表情:赞]` -> "用户发送了一个表情：[赞]"
+        - `[表情]`（自定义表情包，无具体名）-> "用户发送了一个表情包（内容见附件图片，无法 OCR 识别）"
+        """
+        m = EMOJI_RE.search(text or "")
+        if not m:
+            return None
+        name = (m.group(1) or "").strip()
+        if name:
+            return f"用户发送了一个表情：[{name}]"
+        return "用户发送了一个表情包（具体内容见附件图片，表情动图无法通过 OCR 识别）"
+
+    @staticmethod
+    def _is_emoji_image(comp, text: str) -> bool:
+        """判断图片组件是否疑似平台表情图（如 QQ 官方把表情解析为 [表情] 文本 + 图片附件）。
+
+        命中条件（任一）：
+        - 消息文本含 QQ 表情标记 `[表情`（`_parse_face_message` 输出，如 `[表情]`、`[表情:赞]`）；
+        - 图片 url/file 带常见表情特征（emoticon / sticker / qqface / face / emoji / biaoqing 等）。
+        """
+        if "[表情" in (text or ""):
+            return True
+        url = str(getattr(comp, "url", "") or getattr(comp, "file", "") or "").lower()
+        for kw in ("emoticon", "sticker", "qqface", "face/", "face_", "emoji", "biaoqing", "emotion"):
+            if kw in url:
+                return True
+        return False
+
+    def _extract_images(self, event: AstrMessageEvent, text: str = "") -> list:
+        """从消息链中提取所有 Image 组件（自动跳过平台表情图，避免把表情当图片 OCR）。"""
         components = getattr(event.message_obj, "message", None) or []
         images = []
         for comp in components:
             ctype = getattr(comp, "type", None)
             if ctype == "image" or type(comp).__name__ == "Image":
+                if self._is_emoji_image(comp, text):
+                    logger.debug("[image_bridge] 跳过平台表情图（不进入 OCR）")
+                    continue
                 images.append(comp)
         return images
 
@@ -128,10 +166,29 @@ class ImageBridgePlugin(Star):
             raise RuntimeError("OCR 接口未返回识别结果")
         return (parsed[0].get("ParsedText") or "").strip()
 
+    @staticmethod
+    def _is_gif(images: list) -> bool:
+        """判断图片组件列表是否均为 GIF 动图（按 url/file 后缀，或本地文件头）。"""
+        for img in images:
+            src = str(
+                getattr(img, "url", "") or getattr(img, "file", "") or ""
+            ).lower()
+            if src.endswith(".gif"):
+                continue
+            return False
+        return bool(images)
+
     async def _recognize_images(self, images: list) -> str:
-        """逐张识别图片，拼接多图识别结果。"""
+        """逐张识别图片，拼接多图识别结果（gif 动图不 OCR，附占位说明供 AI 知晓）。"""
         parts = []
         for i, img in enumerate(images, start=1):
+            if self._is_gif([img]):
+                logger.debug("[image_bridge] 动图不进入 OCR，附占位说明")
+                if len(images) > 1:
+                    parts.append(f"图片{i}:（GIF 动图，无法识别文字内容）")
+                else:
+                    parts.append("（GIF 动图，无法识别文字内容）")
+                continue
             try:
                 file_path = await img.convert_to_file_path()
             except Exception as e:
@@ -157,37 +214,66 @@ class ImageBridgePlugin(Star):
     # ---------------------------------------------------------------- 事件
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
-        """处理图片消息：识别并挂起识别内容；纯图片消息不让 AI 回答。"""
-        images = self._extract_images(event)
+        """处理图片/表情消息：识别并挂起内容；纯图片/表情消息不让 AI 回答（等待提问）。
+
+        表情处理：QQ 官方把表情解析为 `[表情]`/`[表情:赞]` 文本 + 图片附件。
+        - 文本标记本身 AI 可理解（`[表情:赞]`），表情图（gif）不进 OCR；
+        - 自定义表情包（`[表情]` 无名字 + gif 图）生成语义描述挂起，AI 至少知道用户发了表情包；
+        - `emoji_wait_pending` 开关：关闭时表情不挂起、不拦截，消息正常走（文本标记进 LLM）。
+        """
         text = (event.message_str or "").strip()
+        # 去掉表情标记后的"真实文字"：QQ 把表情转成 [表情]/[表情:赞] 文本，
+        # 只有真实文字才算"文字提问"；纯表情标记视为"只发了表情"
+        pure_text = EMOJI_RE.sub("", text).strip()
         key = self._pending_key(event)
-        if not images:
+        emoji_desc = self._extract_emoji_desc(text)
+        images = self._extract_images(event, text)
+
+        if not images and not emoji_desc:
             return  # 纯文字消息：由 on_llm_request 判断是否有挂起的图片内容
 
-        try:
-            content = await self._recognize_images(images)
-        except Exception as e:
-            logger.error(f"图片识别失败: {e}")
-            event.stop_event()
-            yield event.plain_result(f"⚠️ 图片识别失败：{e}，请稍后重试或换一张更清晰的图片。")
-            return
+        # 组装挂起内容：表情语义（AI 可理解）+ OCR 识别文字
+        content_parts: list[str] = []
+        if emoji_desc:
+            content_parts.append(emoji_desc)
+        if images:
+            try:
+                ocr = await self._recognize_images(images)
+                if ocr:
+                    content_parts.append(ocr)
+            except Exception as e:
+                logger.error(f"图片识别失败: {e}")
+                if not emoji_desc:
+                    # 无表情兜底时，OCR 失败才打扰用户；有表情语义则保留表情部分继续
+                    event.stop_event()
+                    yield event.plain_result(
+                        f"⚠️ 图片识别失败：{e}，请稍后重试或换一张更清晰的图片。"
+                    )
+                    return
+                logger.warning(f"[image_bridge] 图片 OCR 失败，仅保留表情语义: {e}")
 
+        content = "\n\n".join(p for p in content_parts if p)
         if not content:
-            event.stop_event()
-            yield event.plain_result("⚠️ 未能从图片中识别出文字内容，请换一张更清晰的图片后重试。")
+            return  # 无任何可挂起内容
+
+        # 纯表情（无真实图片、无真实文字）且开关关闭：不挂起、不拦截，消息正常走
+        if not images and not pure_text and emoji_desc and not bool(
+            self._cfg("emoji_wait_pending", DEFAULT_EMOJI_WAIT_PENDING)
+        ):
+            logger.debug("[image_bridge] 表情不参与等待（emoji_wait_pending=false），放行")
             return
 
         self._pending[key] = {"text": content, "ts": time.time()}
         self._prune_pending()
 
-        if text:
-            # 图片 + 文字同时发送：不拦截，on_llm_request 会把识别内容注入本次提问
+        if pure_text:
+            # 图片/表情 + 真实文字同时发送：不拦截，on_llm_request 会把内容注入本次提问
             logger.info(
                 f"[image_bridge] 收到图片+文字消息 (session={event.unified_msg_origin})"
             )
             return
 
-        # 只发了图片：静默挂起识别内容，拦截本次消息（AI 不回答），后台等待用户提问
+        # 只发了图片/表情：静默挂起识别内容，拦截本次消息（AI 不回答），后台等待用户提问
         event.stop_event()
 
     @filter.command("picreset")

@@ -27,6 +27,11 @@
     "description": "图片识别内容有效期（秒），超时后需重新发送图片",
     "default": 1800
   },
+  "emoji_wait_pending": {
+    "type": "bool",
+    "description": "发送表情后是否也进入「等待提问」模式（挂起表情语义，用户提问时注入 LLM）。关闭时表情不挂起、不拦截，消息正常回复",
+    "default": true
+  },
   "prompt_template": {
     "type": "text",
     "description": "注入给 AI 的提示词模板，{image_content} 会被替换为识别出的文字",
