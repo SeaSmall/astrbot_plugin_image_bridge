@@ -262,7 +262,6 @@ class ImageBridgePlugin(Star):
         images = self._extract_images(event, text)
 
         if not images and not emoji_desc:
-            logger.debug("[image_bridge] 纯文字消息，不拦截")
             return  # 纯文字消息：由 on_llm_request 判断是否有挂起的图片内容
 
         # 组装挂起内容：表情语义（AI 可理解）+ OCR 识别文字
@@ -287,11 +286,7 @@ class ImageBridgePlugin(Star):
 
         content = "\n\n".join(p for p in content_parts if p)
         if not content:
-            # 有图片/表情但 OCR 未识别到文字：不能放行，否则 AI 会直接回复。
-            # 挂起一个占位标记并继续拦截等待提问。
-            if not images and not emoji_desc:
-                return
-            content = "[用户发送了一张图片，但未识别到其中的文字内容]"
+            return  # 无任何可挂起内容
 
         self._pending[key] = {"text": content, "ts": time.time()}
         self._prune_pending()
