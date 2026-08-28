@@ -286,7 +286,11 @@ class ImageBridgePlugin(Star):
 
         content = "\n\n".join(p for p in content_parts if p)
         if not content:
-            return  # 无任何可挂起内容
+            # 有图片/表情但 OCR 未识别到文字：不能放行，否则 AI 会直接回复。
+            # 挂起一个占位标记并继续拦截等待提问，保证"发图→等待提问→回答"流程完整。
+            if not images and not emoji_desc:
+                return
+            content = "[用户发送了一张图片，但未识别到其中的文字内容]"
 
         self._pending[key] = {"text": content, "ts": time.time()}
         self._prune_pending()
