@@ -79,6 +79,25 @@ class ImageBridgePlugin(Star):
         """构造挂起内容的键：同一会话内按发送者区分。"""
         return f"{event.unified_msg_origin}:::{event.get_sender_id()}"
 
+    def _gate_event(self, event: AstrMessageEvent) -> None:
+        """静默拦截消息：禁止默认 LLM 请求并停止事件传播（双重保险）。
+
+        - `stop_event()`：停止事件继续传播；
+        - `should_call_llm(True)`：AstrBot 官方「禁止默认 LLM 请求」接口，
+          在事件管道中显式跳过 LLM 调用，避免不同版本管道行为差异导致
+          纯图片消息仍被 LLM 处理（AI 直接回复）。
+        """
+        event.stop_event()
+        should_call_llm = getattr(event, "should_call_llm", None)
+        if callable(should_call_llm):
+            try:
+                should_call_llm(True)
+            except Exception as e:
+                logger.debug(f"[image_bridge] should_call_llm 调用失败: {e}")
+        logger.info(
+            f"[image_bridge] 已拦截消息等待提问 (session={event.unified_msg_origin})"
+        )
+
     @staticmethod
     def _extract_emoji_desc(text: str) -> str | None:
         """从消息文本提取 QQ 表情语义描述（AI 可理解），无表情标记返回 None。
@@ -423,14 +442,8 @@ class ImageBridgePlugin(Star):
                     content_parts.append(ocr)
             except Exception as e:
                 logger.error(f"图片识别失败: {e}")
-                if not emoji_desc:
-                    # 无表情兜底时，OCR 失败才打扰用户；有表情语义则保留表情部分继续
-                    event.stop_event()
-                    yield event.plain_result(
-                        f"⚠️ 图片识别失败：{e}，请稍后重试或换一张更清晰的图片。"
-                    )
-                    return
-                logger.warning(f"[image_bridge] 图片 OCR 失败，仅保留表情语义: {e}")
+                # 识别失败也不打扰用户：挂起占位内容，等待用户提问时让 AI 知道图片没读到
+                content_parts.append("[图片识别失败，未能获取图片内容]")
 
         content = "\n\n".join(p for p in content_parts if p)
         if not content:
@@ -465,7 +478,7 @@ class ImageBridgePlugin(Star):
                 return
 
         # 只发了图片/无名字表情包：静默挂起识别内容，拦截本次消息（AI 不回答），后台等待用户提问
-        event.stop_event()
+        self._gate_event(event)
 
     @filter.command("picreset")
     async def picreset(self, event: AstrMessageEvent):
