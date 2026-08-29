@@ -192,24 +192,15 @@ class ImageBridgePlugin(Star):
             logger.warning(f"[image_bridge] gif 切帧失败，使用原图: {e}")
             return file_path
 
-    async def _recognize_image(self, file_path: str) -> str:
-        """按优先级链识别单张图片：小米 MiMo → 百度图像识别 → OCR.space。
+    async def _recognize_image(self, data: bytes, ext: str) -> str:
+        """按优先级链识别单张图片字节：小米 MiMo → 百度图像识别 → OCR.space。
 
         - 配置了对应 key 的服务才启用：小米填了 xiaomi_api_key 才启用，
           百度填了 baidu_api_key + baidu_secret_key 才启用；OCR.space 兜底。
         - 某服务返回异常（抛错）自动降级到下一个；全部失败才报错。
-        - gif 动图自动切帧为静态图后再识别（让 AI 看懂表情包）。
+        - 图片字节已在事件生命周期内读取完毕（gif 已切帧），
+          后台识别不再依赖平台临时文件（事件结束后会被 AstrBot 清理）。
         """
-        data = Path(file_path).read_bytes()
-        ext = Path(file_path).suffix.lower().lstrip(".")
-        if ext not in ("png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp"):
-            ext = self._sniff_image_ext(data)
-        # gif 动图：切第一帧为 JPEG 静态图，所有识别服务都能处理
-        if ext == "gif" or self._sniff_image_ext(data) == "gif":
-            jpg_path = self._gif_to_static_frame(file_path)
-            if jpg_path != file_path:
-                data = Path(jpg_path).read_bytes()
-                ext = "jpg"
         mime, _ = mimetypes.guess_type(f"image.{ext}") if ext else (None, None)
         mime = mime or "application/octet-stream"
 
@@ -375,31 +366,39 @@ class ImageBridgePlugin(Star):
             raise RuntimeError("OCR 接口未返回识别结果")
         return (parsed[0].get("ParsedText") or "").strip()
 
-    @staticmethod
-    def _is_gif(images: list) -> bool:
-        """判断图片组件列表是否均为 GIF 动图（按 url/file 后缀，或本地文件头）。"""
-        for img in images:
-            src = str(
-                getattr(img, "url", "") or getattr(img, "file", "") or ""
-            ).lower()
-            if src.endswith(".gif"):
-                continue
-            return False
-        return bool(images)
+    async def _prepare_media(self, images: list) -> list[tuple[bytes, str]]:
+        """在事件生命周期内把图片读成内存字节（含 gif 切帧），返回 [(data, ext), ...]。
 
-    async def _recognize_images(self, images: list) -> str:
-        """逐张识别图片，拼接多图识别结果（gif 动图自动切帧后识别，让 AI 看懂表情包）。"""
-        parts = []
-        for i, img in enumerate(images, start=1):
-            if self._is_gif([img]):
-                logger.debug("[image_bridge] 动图将切帧后识别（表情包文字）")
+        平台临时图片文件在事件处理结束后会被 AstrBot 清理，
+        因此必须在 handler 内（事件还活着时）把字节读取出来，
+        后台识别任务只做网络请求、不再依赖临时文件。
+        """
+        media: list[tuple[bytes, str]] = []
+        for img in images:
             try:
                 file_path = await img.convert_to_file_path()
+                data = Path(file_path).read_bytes()
+                ext = Path(file_path).suffix.lower().lstrip(".")
+                if ext not in ("png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp"):
+                    ext = self._sniff_image_ext(data)
+                # gif 动图：切第一帧为 JPEG 静态图，所有识别服务都能处理
+                if ext == "gif":
+                    jpg_path = self._gif_to_static_frame(file_path)
+                    if jpg_path != file_path:
+                        data = Path(jpg_path).read_bytes()
+                        ext = "jpg"
+                        Path(jpg_path).unlink(missing_ok=True)  # 清理切帧临时文件
+                media.append((data, ext))
             except Exception as e:
-                logger.warning(f"图片转本地路径失败: {e}")
-                raise RuntimeError(f"无法获取第 {i} 张图片的数据") from e
-            text = await self._recognize_image(file_path)
-            if len(images) > 1:
+                logger.warning(f"[image_bridge] 图片读取失败: {e}")
+        return media
+
+    async def _recognize_media(self, media: list[tuple[bytes, str]]) -> str:
+        """逐张识别内存中的图片字节，拼接多图识别结果。"""
+        parts = []
+        for i, (data, ext) in enumerate(media, start=1):
+            text = await self._recognize_image(data, ext)
+            if len(media) > 1:
                 parts.append(f"图片{i}:\n{text}")
             else:
                 parts.append(text)
@@ -416,34 +415,39 @@ class ImageBridgePlugin(Star):
             self._pending.clear()
 
     def _spawn_recognition(
-        self, entry: dict, images: list, emoji_desc: str | None
+        self, entry: dict, media: list[tuple[bytes, str]], emoji_desc: str | None,
+        had_images: bool,
     ) -> None:
-        """后台异步识别图片，完成后把结果写入该挂起条目并唤醒等待者。
+        """后台异步识别图片字节，完成后把结果写入该挂起条目并唤醒等待者。
 
         直接持有 entry 引用：连发多张图片时旧任务只写旧条目，不会覆盖新条目。
         """
         task = asyncio.create_task(
-            self._recognize_and_store(entry, images, emoji_desc)
+            self._recognize_and_store(entry, media, emoji_desc, had_images)
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
     async def _recognize_and_store(
-        self, entry: dict, images: list, emoji_desc: str | None
+        self, entry: dict, media: list[tuple[bytes, str]], emoji_desc: str | None,
+        had_images: bool,
     ) -> None:
         """识别并写入挂起内容（失败/为空时写入占位文本），随后唤醒 on_llm_request。"""
         content_parts: list[str] = []
         if emoji_desc:
             content_parts.append(emoji_desc)
-        if images:
+        if media:
             try:
-                ocr = await self._recognize_images(images)
+                ocr = await self._recognize_media(media)
                 if ocr:
                     content_parts.append(ocr)
             except Exception as e:
                 logger.error(f"图片识别失败: {e}")
                 # 识别失败也不打扰用户：挂起占位内容，让 AI 知道图片没读到
                 content_parts.append("[图片识别失败，未能获取图片内容]")
+        elif had_images:
+            # 图片存在但字节读取失败（如临时文件已被清理/下载失败）
+            content_parts.append("[图片读取失败，未能获取图片内容]")
         content = "\n\n".join(p for p in content_parts if p)
         if not content:
             content = "[用户发送了一张图片，但未识别到其中的文字内容]"
@@ -477,7 +481,10 @@ class ImageBridgePlugin(Star):
         entry = {"text": None, "ts": time.time(), "event": asyncio.Event()}
         self._pending[key] = entry
         self._prune_pending()
-        self._spawn_recognition(entry, images, emoji_desc)
+        # 事件生命周期内读取图片字节（临时文件在事件结束后会被 AstrBot 清理），
+        # 后台任务只做网络识别、不再依赖临时文件
+        media = await self._prepare_media(images)
+        self._spawn_recognition(entry, media, emoji_desc, bool(images))
 
         if pure_text:
             # 图片/表情 + 真实文字同时发送：不拦截，on_llm_request 会把内容注入本次提问
