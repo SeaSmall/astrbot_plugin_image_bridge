@@ -14,6 +14,7 @@ astrbot_plugin_image_bridge — 图片问答桥接插件（Image Bridge）
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import mimetypes
 import re
@@ -38,6 +39,7 @@ DEFAULT_OCR_LANGUAGE = "chs"  # chs=简体中文 / eng=英文 / chinese_tra=繁�
 DEFAULT_OCR_TIMEOUT = 60  # 识别请求超时（秒）
 DEFAULT_PENDING_TTL = 1800  # 图片识别内容有效期（秒），超时后需重新发送图片
 DEFAULT_EMOJI_WAIT_PENDING = True  # 表情是否也参与「发送后等待提问」门控
+DEFAULT_RECOGNITION_WAIT = 30  # 用户提问时等待图片识别完成的最长时间（秒）
 # 小米 MiMo Token Plan（OpenAI 兼容；Key 格式 tp-xxxxx）
 DEFAULT_XIAOMI_BASE_URL = "https://token-plan-cn.xiaomimimo.com/v1"
 DEFAULT_XIAOMI_MODEL = "mimo-v2.5"  # 支持图片理解；也可用 mimo-v2.5-pro
@@ -61,9 +63,13 @@ class ImageBridgePlugin(Star):
     def __init__(self, context: Context, config: dict | None = None) -> None:
         super().__init__(context)
         self.config = config or {}
-        # 挂起的图片识别内容：{key: {"text": str, "ts": float}}
+        # 挂起的图片识别内容：{key: {"text": str | None, "ts": float, "event": asyncio.Event}}
+        # text 为 None 表示识别仍在进行（收到图片即占位挂起，识别完成后填充）；
+        # event 用于让 on_llm_request 等待识别完成，避免用户提问过快时漏注入
         # key = 会话 + 发送者，避免群聊中 A 的图片被 B 的问题消费
         self._pending: dict[str, dict] = {}
+        # 后台识别任务集合（防止被 GC，完成后自动移除）
+        self._tasks: set = set()
         # 百度 access_token 缓存：{"token": str, "exp": float}
         self._baidu_token: dict | None = None
 
@@ -409,6 +415,41 @@ class ImageBridgePlugin(Star):
         if len(self._pending) > 500:  # 兜底：防止极端情况下内存膨胀
             self._pending.clear()
 
+    def _spawn_recognition(
+        self, entry: dict, images: list, emoji_desc: str | None
+    ) -> None:
+        """后台异步识别图片，完成后把结果写入该挂起条目并唤醒等待者。
+
+        直接持有 entry 引用：连发多张图片时旧任务只写旧条目，不会覆盖新条目。
+        """
+        task = asyncio.create_task(
+            self._recognize_and_store(entry, images, emoji_desc)
+        )
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _recognize_and_store(
+        self, entry: dict, images: list, emoji_desc: str | None
+    ) -> None:
+        """识别并写入挂起内容（失败/为空时写入占位文本），随后唤醒 on_llm_request。"""
+        content_parts: list[str] = []
+        if emoji_desc:
+            content_parts.append(emoji_desc)
+        if images:
+            try:
+                ocr = await self._recognize_images(images)
+                if ocr:
+                    content_parts.append(ocr)
+            except Exception as e:
+                logger.error(f"图片识别失败: {e}")
+                # 识别失败也不打扰用户：挂起占位内容，让 AI 知道图片没读到
+                content_parts.append("[图片识别失败，未能获取图片内容]")
+        content = "\n\n".join(p for p in content_parts if p)
+        if not content:
+            content = "[用户发送了一张图片，但未识别到其中的文字内容]"
+        entry["text"] = content
+        entry["event"].set()
+
     # ---------------------------------------------------------------- 事件
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
@@ -431,30 +472,12 @@ class ImageBridgePlugin(Star):
         if not images and not emoji_desc:
             return  # 纯文字消息：由 on_llm_request 判断是否有挂起的图片内容
 
-        # 组装挂起内容：表情语义（AI 可理解）+ OCR 识别文字
-        content_parts: list[str] = []
-        if emoji_desc:
-            content_parts.append(emoji_desc)
-        if images:
-            try:
-                ocr = await self._recognize_images(images)
-                if ocr:
-                    content_parts.append(ocr)
-            except Exception as e:
-                logger.error(f"图片识别失败: {e}")
-                # 识别失败也不打扰用户：挂起占位内容，等待用户提问时让 AI 知道图片没读到
-                content_parts.append("[图片识别失败，未能获取图片内容]")
-
-        content = "\n\n".join(p for p in content_parts if p)
-        if not content:
-            # 有图片/表情但 OCR 未识别到文字：不能放行，否则 AI 会直接回复。
-            # 挂起一个占位标记并继续拦截等待提问，保证"发图→等待提问→回答"流程完整。
-            if not images and not emoji_desc:
-                return
-            content = "[用户发送了一张图片，但未识别到其中的文字内容]"
-
-        self._pending[key] = {"text": content, "ts": time.time()}
+        # 收到图片/表情立即占位挂起（识别在后台异步进行），
+        # 避免用户提问过快时 on_llm_request 检查时识别结果尚未写入而漏注入
+        entry = {"text": None, "ts": time.time(), "event": asyncio.Event()}
+        self._pending[key] = entry
         self._prune_pending()
+        self._spawn_recognition(entry, images, emoji_desc)
 
         if pure_text:
             # 图片/表情 + 真实文字同时发送：不拦截，on_llm_request 会把内容注入本次提问
@@ -498,8 +521,24 @@ class ImageBridgePlugin(Star):
             self._pending.pop(key, None)
             return
 
+        # 若识别仍在进行（用户提问过快），限时等待识别完成后再注入
+        if not pending["event"].is_set():
+            wait_timeout = int(
+                self._cfg("recognition_wait_timeout", DEFAULT_RECOGNITION_WAIT)
+                or DEFAULT_RECOGNITION_WAIT
+            )
+            try:
+                await asyncio.wait_for(pending["event"].wait(), timeout=wait_timeout)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[image_bridge] 等待图片识别完成超时（{wait_timeout}s），按当前内容注入"
+                )
+
+        image_text = pending.get("text")
+        if not image_text:
+            image_text = "[用户上传了图片，但识别内容未就绪]"
         template = self._cfg("prompt_template", DEFAULT_PROMPT_TEMPLATE)
-        content = template.format(image_content=pending["text"])
+        content = template.format(image_content=image_text)
         try:
             from astrbot.core.agent.message import TextPart  # v4.16+ 推荐方式
 
@@ -514,6 +553,9 @@ class ImageBridgePlugin(Star):
         )
 
     async def terminate(self) -> None:
-        """插件卸载/停用时清空挂起内容。"""
+        """插件卸载/停用时清空挂起内容并取消后台识别任务。"""
+        for task in list(self._tasks):
+            task.cancel()
+        self._tasks.clear()
         self._pending.clear()
 
