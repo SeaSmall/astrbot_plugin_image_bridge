@@ -1,14 +1,48 @@
 {
+  "xiaomi_api_key": {
+    "type": "string",
+    "description": "小米 MiMo Token Plan API Key（优先级最高，填了才启用）",
+    "hint": "获取 Key：[MiMo 开放平台控制台 → Token Plan](https://platform.xiaomimimo.com/#/console/plan-manage)（订阅套餐后获取专属 Base URL 与 Key，格式 tp-xxxxx）",
+    "obvious_hint": true,
+    "default": ""
+  },
+  "xiaomi_base_url": {
+    "type": "string",
+    "description": "小米 Token Plan 接口地址（区域）",
+    "hint": "默认中国区。其他区域：`https://token-plan-ams.xiaomimimo.com/v1`（美西）、`https://token-plan-sgp.xiaomimimo.com/v1`（新加坡）",
+    "default": "https://token-plan-cn.xiaomimimo.com/v1"
+  },
+  "xiaomi_model": {
+    "type": "string",
+    "description": "小米识图模型",
+    "hint": "推荐 `mimo-v2.5`（支持图片理解）；也可填 `mimo-v2.5-pro`",
+    "default": "mimo-v2.5"
+  },
+  "baidu_api_key": {
+    "type": "string",
+    "description": "百度智能云图像识别 API Key（次级优先，与 Secret Key 都填了才启用）",
+    "hint": "获取 Key：[百度智能云控制台-图像识别](https://console.bce.baidu.com/ai/?fromai=1#/ai/imagerecognition/app/list) 创建应用；操作指引见[新手操作指引](https://cloud.baidu.com/doc/IMAGERECOGNITION/s/2l3wrxcbs)，接口文档见[图像识别](https://cloud.baidu.com/doc/IMAGERECOGNITION/s/7k3bcxdn8)",
+    "obvious_hint": true,
+    "default": ""
+  },
+  "baidu_secret_key": {
+    "type": "string",
+    "description": "百度智能云图像识别 Secret Key",
+    "hint": "与上方的 API Key 在同一个应用中获取",
+    "obvious_hint": true,
+    "default": ""
+  },
   "ocr_api_url": {
     "type": "string",
-    "description": "OCR 接口地址",
+    "description": "OCR 接口地址（兜底服务）",
     "hint": "默认使用 OCR.space 免费接口。",
     "default": "https://api.ocr.space/parse/image"
   },
   "ocr_api_key": {
     "type": "string",
-    "description": "OCR.space 免费 API Key",
-    "hint": "默认 \"helloworld\" 为 OCR.space 公开测试 key（免费但有限流）。建议到 https://ocr.space/ocrapi 免费注册获取专属 key。",
+    "description": "OCR.space 免费 API Key（兜底服务）",
+    "hint": "默认 \"helloworld\" 为 OCR.space 公开测试 key（免费但有限流）。免费注册获取专属 key：[OCR.space](https://ocr.space/ocrapi)",
+    "obvious_hint": true,
     "default": "helloworld"
   },
   "ocr_language": {
@@ -19,7 +53,7 @@
   },
   "ocr_timeout": {
     "type": "int",
-    "description": "OCR 请求超时时间（秒）",
+    "description": "识别请求超时时间（秒）",
     "default": 60
   },
   "pending_ttl": {
@@ -34,8 +68,8 @@
   },
   "prompt_template": {
     "type": "text",
-    "description": "注入给 AI 的提示词模板，{image_content} 会被替换为识别出的文字",
-    "default": "<用户上传的图片识别内容>\n{image_content}\n</用户上传的图片识别内容>\n以上是用户刚上传图片的 OCR 识别文字，请结合该图片内容回答用户的问题。"
+    "description": "注入给 AI 的提示词模板，{image_content} 会被替换为识别出的内容",
+    "default": "<用户上传的图片识别内容>\n{image_content}\n</用户上传的图片识别内容>\n以上是用户刚上传图片的识别结果（文字 OCR / 图像识别描述），请结合该图片内容回答用户的问题。"
   }
 }
 

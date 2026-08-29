@@ -1,6 +1,6 @@
 # astrbot_plugin_image_bridge（图片问答桥接）
 
-一个 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 插件：**用户发图片 → 插件调用免费 OCR 接口识别图片文字 → 用户再发文字提问时，把识别内容连同问题一起交给 AI 回答**。
+一个 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 插件：**用户发图片 → 插件按「小米 MiMo → 百度图像识别 → OCR.space」三级优先链识别图片 → 用户再发文字提问时，把识别内容连同问题一起交给 AI 回答**。
 
 核心规则（图片门控问答）：
 
@@ -16,7 +16,7 @@
 ## 工作原理
 
 ```
-用户发图片 ──► 插件调用 OCR.space 免费接口识别文字并静默挂起
+用户发图片 ──► 插件按 小米 MiMo → 百度 → OCR 三级链识别并静默挂起
                   │
                   ├─ 只发图片？──► 拦截本条消息（AI 不回答），后台等待用户提问
                   │
@@ -25,7 +25,11 @@
 用户发文字问题 ──► on_llm_request 钩子把挂起的图片识别内容注入本次请求 ──► AI 一并回答
 ```
 
-- 图片识别使用 [OCR.space](https://ocr.space/) 免费 API（默认语言 `chs` 简体中文，可配置）。
+- **识别服务三级优先链**（配置了对应 key 的服务才启用，异常自动降级）：
+  1. **小米 MiMo Token Plan 识图模型**（默认 `mimo-v2.5`，可同时理解图片内容与文字）；
+  2. **百度智能云图像识别**（通用物体和场景识别 `advanced_general`）；
+  3. **OCR.space** 免费 OCR（兜底，默认语言 `chs` 简体中文）。
+  各服务 key 的获取链接已放在 WebUI 插件配置对应输入框下方。
 - 挂起的识别内容按「会话 + 发送者」隔离（群聊中 A 的图片不会被 B 的问题消费），默认有效期 30 分钟（可配置）。
 - 识别内容通过 `on_llm_request` 钩子以临时内容块（`mark_as_temp`）注入，不写入会话历史。
 
@@ -88,13 +92,18 @@ services:
 
 | 配置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `ocr_api_url` | string | `https://api.ocr.space/parse/image` | OCR 接口地址 |
-| `ocr_api_key` | string | `helloworld` | OCR.space API Key。默认值为其公开测试 key（免费、有限流），建议到 [ocr.space/ocrapi](https://ocr.space/ocrapi) 免费注册获取专属 key 后填入 |
+| `xiaomi_api_key` | string | 空 | 小米 MiMo Token Plan API Key（格式 `tp-xxxxx`），填了才启用小米识别。获取链接见输入框下方 |
+| `xiaomi_base_url` | string | `https://token-plan-cn.xiaomimimo.com/v1` | 小米 Token Plan 接口地址（默认中国区；AMS/SGP 见配置提示） |
+| `xiaomi_model` | string | `mimo-v2.5` | 小米识图模型（支持图片理解；也可用 `mimo-v2.5-pro`） |
+| `baidu_api_key` | string | 空 | 百度智能云图像识别 API Key，与 Secret Key 都填了才启用。获取链接见输入框下方 |
+| `baidu_secret_key` | string | 空 | 百度智能云图像识别 Secret Key |
+| `ocr_api_url` | string | `https://api.ocr.space/parse/image` | OCR 接口地址（兜底服务） |
+| `ocr_api_key` | string | `helloworld` | OCR.space API Key（兜底服务）。默认值为其公开测试 key（免费、有限流），免费注册获取专属 key：[ocr.space/ocrapi](https://ocr.space/ocrapi) |
 | `ocr_language` | string | `chs` | 识别语言：`chs`=简体中文、`eng`=英文、`chinese_tra`=繁体中文 等 |
-| `ocr_timeout` | int | `60` | OCR 请求超时（秒） |
+| `ocr_timeout` | int | `60` | 识别请求超时（秒） |
 | `pending_ttl` | int | `1800` | 图片识别内容有效期（秒），超时后需重新发送图片 |
 | `emoji_wait_pending` | bool | `true` | 发送表情后是否也进入「等待提问」模式（挂起表情语义，用户提问时注入 LLM）。关闭时表情不挂起、不拦截，消息正常回复 |
-| `prompt_template` | text | 见默认值 | 注入给 AI 的提示词模板，`{image_content}` 会被替换为识别文字 |
+| `prompt_template` | text | 见默认值 | 注入给 AI 的提示词模板，`{image_content}` 会被替换为识别出的内容 |
 
 ## 使用说明
 
@@ -106,6 +115,7 @@ services:
 
 ## 更新日志
 
+- **v1.0.7**：**识别服务升级为三级优先链**——新增小米 MiMo Token Plan 识图模型（默认 `mimo-v2.5`）与百度智能云图像识别（通用物体和场景识别）。填入对应 key 后按「小米 → 百度 → OCR.space」顺序识别，前一服务异常自动降级到下一服务；各服务 key 获取链接已放入 WebUI 配置输入框下方。
 - **v1.0.6**：按表情类型区分行为——**带名字表情（`[表情:赞]`）永不拦截**（AI 直接理解并回复）；单 `[表情]`（自定义表情包）默认拦截等待提问，`emoji_wait_pending=false` 时直接回复。
 - **v1.0.5**：修复 `emoji_wait_pending=false` 时表情包（带 GIF 图片）仍被拦截等待提问的问题——开关现在对**含表情标记的消息一律生效**（含表情包），关闭后 AI 直接回复，表情包 OCR 内容仍注入供参考。
 - **v1.0.4**：**表情包也能让 AI 看懂**——
@@ -123,9 +133,10 @@ services:
 - **只发图片后没有任何回复**：这是插件设计——收到图片后静默等待，必须先发图片、再发文字问题，AI 才会回答。
 - **群聊中误用他人图片**：挂起内容按发送者隔离，A 的图片不会被 B 的问题消费。
 - **发了自定义表情包（单 `[表情]` + GIF）后机器人不回复**：表情包默认进入「等待提问」模式——发表情包后需再发文字问题，AI 才会结合表情包 OCR 文字回答；若希望表情包立即被正常回复，将 `emoji_wait_pending` 关闭即可。带名字表情（`[表情:赞]`）不受此影响，始终直接回复。
-- **GIF 动图识别不了文字**：已自动处理——插件会把 GIF 切第一帧转成 JPEG 再 OCR，识别表情包/动图上写的文字（需安装 Pillow，`requirements.txt` 已包含）。
+- **GIF 动图识别不了文字**：已自动处理——插件会把 GIF 切第一帧转成 JPEG 再识别，识别表情包/动图上写的文字（需安装 Pillow，`requirements.txt` 已包含）。
+- **识别服务如何选择**：配置了小米 key 时优先小米，异常自动换百度，再异常换 OCR.space；只配置百度则跳过小米；都不配置则仅用 OCR.space（有默认测试 key，开箱即用）。
 
 ## 开源许可
 
-本项目基于 [MIT License](LICENSE) 开源。图片识别能力来自 [OCR.space](https://ocr.space/) 免费 API，其服务条款与免费额度请以其官网为准。
+本项目基于 [MIT License](LICENSE) 开源。识别能力分别来自 [小米 MiMo](https://platform.xiaomimimo.com/)、[百度智能云图像识别](https://cloud.baidu.com/doc/IMAGERECOGNITION/s/7k3bcxdn8) 与 [OCR.space](https://ocr.space/)，各服务条款与免费额度请以其官网为准。
 
